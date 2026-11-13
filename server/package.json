@@ -1,0 +1,6 @@
+{
+  "name": "nutriscan-vision-server",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=18" }
+}

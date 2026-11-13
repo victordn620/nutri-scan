@@ -1,0 +1,22 @@
+{
+  "expo": {
+    "name": "NutriScan",
+    "slug": "nutriscan",
+    "scheme": "nutriscan",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "plugins": [
+      "expo-router",
+      "expo-sqlite",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "O NutriScan usa a câmera para fotografar alimentos."
+        }
+      ],
+      "expo-status-bar",
+      "expo-font"
+    ]
+  }
+}
