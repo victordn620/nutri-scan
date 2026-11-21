@@ -3,8 +3,14 @@ import { createServer } from 'node:http';
 const port = Number(process.env.PORT ?? 8787);
 const apiKey = process.env.GEMINI_API_KEY;
 const model = (process.env.GEMINI_MODEL ?? 'gemini-flash-latest').replace(/^models\//, '');
-const geminiTimeoutMs = Number(process.env.GEMINI_TIMEOUT_MS ?? 45000);
-const maxAttempts = Number(process.env.GEMINI_MAX_ATTEMPTS ?? 3);
+const geminiTimeoutMs = Number(process.env.GEMINI_TIMEOUT_MS ?? 30000);
+const maxAttempts = Number(process.env.GEMINI_MAX_ATTEMPTS ?? 2);
+const retryableStatus = new Set([408, 429, 500, 502, 503, 504]);
+const fallbackModels = [
+  model,
+  'gemini-3.5-flash-lite',
+  'gemini-flash-lite-latest',
+].filter((name, index, names) => name && names.indexOf(name) === index);
 
 const send = (res, status, body) => {
   res.writeHead(status, {
@@ -40,21 +46,23 @@ const server = createServer(async (req, res) => {
     }
     let gemini;
     let lastTimeout = false;
-    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    for (let attempt = 0; attempt < Math.max(maxAttempts, fallbackModels.length); attempt += 1) {
+      const attemptModel = fallbackModels[Math.min(attempt, fallbackModels.length - 1)];
       lastTimeout = false;
+      gemini = undefined;
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), geminiTimeoutMs);
       try {
-        gemini = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+        gemini = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${attemptModel}:generateContent`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
           signal: controller.signal,
           body: JSON.stringify({
         contents: [{ parts: [
-          { text: 'Você é um reconhecedor visual de alimentos. Analise toda a fotografia e tente identificar cada alimento visível individualmente, incluindo itens in natura e refeições caseiras, não apenas produtos industrializados. Reconheça frutas; verduras e legumes; carnes; arroz, feijão e outros grãos; massas; pães; ovos; laticínios; refeições completas e outros alimentos comuns. Em pratos mistos, liste separadamente cada componente identificável (por exemplo: arroz, feijão, frango e salada). Não invente alimentos que não estejam visíveis, não deduza ingredientes ocultos e não forneça valores nutricionais. Responda somente JSON no formato {"foods":[{"name":"string","confidence":0.0}]}. Use nomes simples em português e inclua apenas itens com confiança igual ou superior a 0.55.' },
+          { text: 'Identifique rapidamente todos os alimentos visíveis nesta foto. Separe componentes de pratos mistos. Use nomes simples em português. Não adivinhe itens ocultos e não informe nutrientes. Responda apenas JSON: {"foods":[{"name":"string","confidence":0.0}]}. Inclua apenas confiança >= 0.55.' },
           { inline_data: { mime_type: 'image/jpeg', data: body.imageBase64 } },
         ] }],
-        generationConfig: { responseMimeType: 'application/json', temperature: 0.1 },
+        generationConfig: { responseMimeType: 'application/json', temperature: 0.1, maxOutputTokens: 160 },
           }),
         });
       } catch (error) {
@@ -67,10 +75,13 @@ const server = createServer(async (req, res) => {
       } finally {
         clearTimeout(timeout);
       }
-      if (!lastTimeout && gemini && ![408, 429, 500, 502, 503, 504].includes(gemini.status)) break;
-      if (attempt < maxAttempts - 1) {
-        const delayMs = 1000 * (attempt + 1);
-        console.warn(`Nova tentativa do Gemini em ${delayMs} ms.`);
+      if (!lastTimeout && gemini && !retryableStatus.has(gemini.status)) break;
+      if (gemini?.status === 404) break;
+      if (attempt < Math.max(maxAttempts, fallbackModels.length) - 1) {
+        const retryAfter = gemini?.headers?.get('retry-after');
+        const parsedRetryAfter = retryAfter && /^\d+$/.test(retryAfter) ? Number(retryAfter) * 1000 : null;
+        const delayMs = parsedRetryAfter ? Math.min(parsedRetryAfter, 5000) : 500 * (attempt + 1);
+        console.warn(`Nova tentativa com ${attemptModel === fallbackModels.at(-1) ? fallbackModels[0] : fallbackModels[attempt + 1]} em ${delayMs} ms (HTTP ${gemini?.status ?? 'timeout'}).`);
         await new Promise((resolve) => setTimeout(resolve, delayMs));
       }
     }
@@ -80,6 +91,15 @@ const server = createServer(async (req, res) => {
     if (!gemini.ok) {
       const details = await gemini.text();
       console.error(`Gemini respondeu ${gemini.status}: ${details.slice(0, 500)}`);
+      if (gemini.status === 503) {
+        return send(res, 503, { error: 'O Gemini está temporariamente sobrecarregado. Aguarde alguns segundos e tente novamente.' });
+      }
+      if (gemini.status === 429) {
+        return send(res, 429, { error: 'O limite de solicitações do Gemini foi atingido. Aguarde antes de tentar novamente.' });
+      }
+      if (gemini.status === 404) {
+        return send(res, 502, { error: 'Nenhum modelo Gemini disponível foi encontrado para esta chave. Atualize a configuração da chave/modelo.' });
+      }
       return send(res, 502, { error: `Gemini recusou a solicitação (HTTP ${gemini.status}).` });
     }
     const result = await gemini.json();

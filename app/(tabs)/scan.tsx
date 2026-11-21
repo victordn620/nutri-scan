@@ -12,6 +12,7 @@ import { c, radius, space, type } from '../../src/theme';
 import { MEALS, type Meal, type Product } from '../../src/types';
 import { identifyFoods, type IdentifiedFood } from '../../src/vision';
 import { searchProducts } from '../../src/api';
+import { findCommonFood, normalizeFoodName } from '../../src/commonFoods';
 import { parseGrams } from '../../src/utils/nutrition';
 
 type ScanState = 'camera' | 'analysing' | 'results';
@@ -62,8 +63,8 @@ export default function Scan() {
     try {
       const optimized = await ImageManipulator.manipulateAsync(
         uri,
-        [{ resize: { width: 1024 } }],
-        { compress: 0.62, format: ImageManipulator.SaveFormat.JPEG, base64: true },
+        [{ resize: { width: 768 } }],
+        { compress: 0.48, format: ImageManipulator.SaveFormat.JPEG, base64: true },
       );
       if (!optimized.base64 || !optimized.uri) throw new Error('Não foi possível preparar a imagem.');
       setPhoto(optimized.uri);
@@ -103,15 +104,38 @@ export default function Scan() {
       const base = { food, product: null, quantity: '100', unit: 'g' as PortionUnit, equivalentGrams: '100' };
       if (!food.name.trim()) return base;
       try {
-        const products = await searchProducts(food.name);
-        const query = food.name.toLocaleLowerCase();
-        const product = products.find((item) => {
-          const name = item.name.toLocaleLowerCase();
-          return name.includes(query) || query.includes(name);
-        }) ?? null;
-        return { ...base, product };
+        const normalize = normalizeFoodName;
+        const normalizedName = normalize(food.name);
+        const aliases: Record<string, string[]> = {
+          hamburger: ['hambúrguer', 'hamburger'],
+          hamburguer: ['hambúrguer', 'hamburger'],
+          queijo: ['queijo'],
+          bacon: ['bacon'],
+        };
+        const searchTerms = [food.name, ...(aliases[normalizedName] ?? [])];
+        let products = await searchProducts(food.name);
+        if (products.length === 0) {
+          for (const term of searchTerms) {
+            if (term === food.name) continue;
+            products = await searchProducts(term);
+            if (products.length > 0) break;
+          }
+        }
+        const query = normalizedName;
+        const queryTerms = query.split(' ').filter((term) => term.length >= 3);
+        const candidates = products.filter((item) => item.kcal != null);
+        const product = candidates
+          .map((item, index) => {
+            const name = normalize(item.name);
+            const exact = name === query;
+            const containsAll = queryTerms.length > 0 && queryTerms.every((term) => name.includes(term));
+            const partial = queryTerms.some((term) => name.includes(term));
+            return { item, score: exact ? 4 : containsAll ? 3 : partial ? 2 : 1, index };
+          })
+          .sort((a, b) => b.score - a.score || a.index - b.index)[0]?.item ?? null;
+        return { ...base, product: product ?? findCommonFood(food.name) };
       } catch {
-        return base;
+        return { ...base, product: findCommonFood(food.name) };
       }
     }));
 
@@ -134,17 +158,26 @@ export default function Scan() {
       }));
       setFoods(currentMatches);
       const missing: string[] = [];
+      let addedCount = 0;
       for (const match of currentMatches) {
         const amount = match.unit === 'g' ? parseGrams(match.quantity) : parseGrams(match.equivalentGrams);
-        if (match.product && amount > 0) await addEntry(db, match.product, amount, meal);
-        else missing.push(match.food.name);
+        if (match.product && amount > 0) {
+          await addEntry(db, match.product, amount, meal);
+          addedCount += 1;
+        } else {
+          missing.push(match.food.name);
+        }
       }
       if (missing.length > 0) {
-        Alert.alert('Alguns alimentos não foram adicionados', `Não encontramos dados nutricionais para: ${missing.join(', ')}.`);
+        Alert.alert(
+          'Revise os alimentos não encontrados',
+          `${addedCount > 0 ? `${addedCount} alimento(s) foram adicionados. ` : ''}Não encontramos dados nutricionais para: ${missing.join(', ')}. Corrija o nome ou edite o valor em gramas.`,
+        );
+        if (addedCount === 0) return;
       } else {
         Alert.alert('Diário atualizado', `${currentMatches.length} alimento(s) adicionado(s) ao diário.`);
+        reset();
       }
-      reset();
     } catch {
       Alert.alert('Não foi possível adicionar', 'Verifique sua conexão e tente novamente.');
     } finally {
