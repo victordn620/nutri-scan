@@ -3,7 +3,8 @@ import { createServer } from 'node:http';
 const port = Number(process.env.PORT ?? 8787);
 const apiKey = process.env.GEMINI_API_KEY;
 const model = (process.env.GEMINI_MODEL ?? 'gemini-flash-latest').replace(/^models\//, '');
-const geminiTimeoutMs = 20000;
+const geminiTimeoutMs = Number(process.env.GEMINI_TIMEOUT_MS ?? 45000);
+const maxAttempts = Number(process.env.GEMINI_MAX_ATTEMPTS ?? 3);
 
 const send = (res, status, body) => {
   res.writeHead(status, {
@@ -38,7 +39,9 @@ const server = createServer(async (req, res) => {
       return send(res, 400, { error: 'Imagem inválida.' });
     }
     let gemini;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    let lastTimeout = false;
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      lastTimeout = false;
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), geminiTimeoutMs);
       try {
@@ -54,12 +57,25 @@ const server = createServer(async (req, res) => {
         generationConfig: { responseMimeType: 'application/json', temperature: 0.1 },
           }),
         });
+      } catch (error) {
+        if (error?.name === 'AbortError') {
+          lastTimeout = true;
+          console.warn(`Gemini excedeu ${geminiTimeoutMs} ms (tentativa ${attempt + 1}/${maxAttempts}).`);
+        } else {
+          throw error;
+        }
       } finally {
         clearTimeout(timeout);
       }
-      if (![429, 500, 503].includes(gemini.status) || attempt === 1) break;
-      console.warn(`Gemini indisponível (HTTP ${gemini.status}); tentando novamente.`);
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      if (!lastTimeout && gemini && ![408, 429, 500, 502, 503, 504].includes(gemini.status)) break;
+      if (attempt < maxAttempts - 1) {
+        const delayMs = 1000 * (attempt + 1);
+        console.warn(`Nova tentativa do Gemini em ${delayMs} ms.`);
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+    if (!gemini && lastTimeout) {
+      return send(res, 504, { error: 'O Gemini demorou muito para responder. Tente novamente em alguns instantes.' });
     }
     if (!gemini.ok) {
       const details = await gemini.text();

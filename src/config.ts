@@ -8,5 +8,5 @@ export const API_CONFIG = {
 } as const;
 
 export const VISION_API_URL = process.env.EXPO_PUBLIC_VISION_API_URL ?? 'http://localhost:8787';
-export const VISION_REQUEST_TIMEOUT_MS = 50000;
+export const VISION_REQUEST_TIMEOUT_MS = 150000;
 export const VISION_CACHE_LIMIT = 10;
